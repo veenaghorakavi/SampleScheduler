@@ -7,9 +7,6 @@ class Task:
     duration: float
     dependencies: [str]
 
-def main():
-    return
-
 def build_arg_parser():
     #hHandles running tasks at the moment. 
     argparser = argparse.ArgumentParser(description="Scheduler")
@@ -17,6 +14,10 @@ def build_arg_parser():
     argparser.add_argument("--format", choices=["text", "json"], default="text")
     argparser.add_argument("--run", action="store_true", help="Run tasks")
     return argparser
+
+def main(argv=None):
+    argparser = build_arg_parser()
+    args = argparser.parse_args(argv)
 
 if __name__ == "__main__":
     main()
