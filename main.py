@@ -1,3 +1,9 @@
+@dataclass(frozen=True)
+class Task:
+    name : str
+    duration: float
+    dependencies: list(str)
+
 def main():
     return
 
