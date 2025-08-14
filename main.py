@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import sys
+import time
+import asyncio
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Dict, List, Tuple
+from typing import Iterable, Dict, List, Tuple, Optional
 from collections import OrderedDict, deque
 
 @dataclass
@@ -14,7 +16,6 @@ class Task:
     name: str
     duration_seconds: float
     deps: List[str]
-
 
 @dataclass
 class TaskSet:
@@ -26,7 +27,6 @@ class TaskSet:
         """Iterate over tasks in the declared order."""
         for name in self.order:
             yield self.tasks[name]
-
 
 def _parse_deps(fields: List[str]):
     """
@@ -47,7 +47,6 @@ def _parse_deps(fields: List[str]):
             ordered.append(dep)
     return ordered
 
-
 def parse_task_line(line: str):
     """
     Parse a single line from the text file into a Task object.
@@ -66,7 +65,6 @@ def parse_task_line(line: str):
     deps = _parse_deps(fields)
     print(f"Created Task: name={name}, duration={duration}, deps={deps}", flush=True)
     return Task(name=name, duration_seconds=duration, deps=deps)
-
 
 def load_tasks_from_text(path: Path):
     """
@@ -112,7 +110,7 @@ def validate_tasks(ts: TaskSet):
     WHITE, GRAY, BLACK = 0, 1, 2  # colors for DFS state
     color: Dict[str, int] = {name: WHITE for name in ts.tasks}
 
-    def dfs(u: str, stack: List[str]) -> bool:
+    def dfs(u: str, stack: List[str]):
         """Recursive DFS to detect cycles."""
         color[u] = GRAY
         stack.append(u)
@@ -134,7 +132,6 @@ def validate_tasks(ts: TaskSet):
             dfs(name, [])
 
     return errors
-
 
 def topo_order(ts: TaskSet):
     """
@@ -166,7 +163,6 @@ def topo_order(ts: TaskSet):
                 q.append(v)
     return order
 
-
 def expected_total_runtime(ts: TaskSet):
     """
     Compute the expected total runtime (critical path length).
@@ -188,11 +184,56 @@ def expected_total_runtime(ts: TaskSet):
     makespan = max(ef.values())
     return makespan, es, ef
 
+async def _run_single(name: str, ts: TaskSet, done_events: Dict[str, asyncio.Event],
+                      sem: Optional[asyncio.Semaphore], start_wall: float, verbose: bool):
+    """Wait for dependencies, then 'execute' the task by sleeping for its duration."""
+    # Wait for all dependency events
+    for d in ts.tasks[name].deps:
+        await done_events[d].wait()
+
+    t = ts.tasks[name]
+
+    async def _do_run():
+        s = time.perf_counter() - start_wall
+        if verbose:
+            deps_str = ts.tasks[name].deps if ts.tasks[name].deps else "-"
+            print(f"[START] {name} at +{s:.3f}s (duration={t.duration_seconds}s, deps={deps_str})", flush=True)
+        await asyncio.sleep(t.duration_seconds)
+        e = time.perf_counter() - start_wall
+        if verbose:
+            print(f"[DONE ] {name} at +{e:.3f}s", flush=True)
+
+    if sem is not None:
+        async with sem:
+            await _do_run()
+    else:
+        await _do_run()
+
+    done_events[name].set()
+
+async def run_tasks(ts: TaskSet, max_workers: Optional[int], verbose: bool):
+    """
+    Execute all tasks in parallel (respecting dependencies).
+    Returns the actual wall-clock runtime in seconds.
+    """
+    # One completion event per task
+    done_events: Dict[str, asyncio.Event] = {n: asyncio.Event() for n in ts.tasks}
+    # Optional concurrency limit
+    sem = asyncio.Semaphore(max_workers) if (max_workers is not None and max_workers > 0) else None
+    start_wall = time.perf_counter()
+
+    # Launch all tasks concurrently; each task waits on its deps
+    async with asyncio.TaskGroup() as tg:
+        for name in ts.tasks:
+            tg.create_task(_run_single(name, ts, done_events, sem, start_wall, verbose))
+
+    total_wall = time.perf_counter() - start_wall
+    return total_wall
 
 def build_arg_parser():
     """Build the argument parser with subcommands."""
     parser = argparse.ArgumentParser(
-        description="Parse, validate, and estimate runtime for a text task list."
+        description="Parse, validate, estimate, and run a text task list."
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -201,17 +242,24 @@ def build_arg_parser():
     p_print.add_argument("task_file", type=Path, help="Path to the task list")
 
     # 'validate' subcommand
-    p_val = sub.add_parser("validate", help="Validate and output expected total runtime (no execution)")
+    p_val = sub.add_parser("validate", help="Validate and output expected total runtime")
     p_val.add_argument("task_file", type=Path, help="Path to the task list")
     p_val.add_argument("--plan", action="store_true", help="Also print earliest start/finish per task")
 
-    return parser
+    # 'run' subcommand
+    p_run = sub.add_parser("run", help="Run tasks in parallel and compare actual vs expected runtime")
+    p_run.add_argument("task_file", type=Path, help="Path to the task list")
+    p_run.add_argument("--max-workers", type=int, default=0,
+                       help="Maximum concurrent tasks (0 means unlimited)")
+    p_run.add_argument("--quiet", action="store_true",
+                       help="Reduce per-task logging")
 
+    return parser
 
 def main(argv: Iterable[str] | None = None):
     """
     Entry point for the CLI tool.
-    Supports 'print' and 'validate' subcommands.
+    Supports 'print', 'validate', and 'run' subcommands.
     Defaults to 'print' if only a .txt file is given.
     """
     if argv is None:
@@ -221,13 +269,12 @@ def main(argv: Iterable[str] | None = None):
     # Auto-inject 'print' if user just runs: main.py file.txt
     if len(argv) >= 1:
         first = str(argv[0])
-        if first not in ("print", "validate") and first.endswith(".txt"):
+        if first not in ("print", "validate", "run") and first.endswith(".txt"):
             argv = ["print"] + argv
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    # Handle 'print'
     if args.command == "print":
         task_set = load_tasks_from_text(args.task_file)
         print("Loaded", len(task_set.tasks), "task(s) from", args.task_file, ":", flush=True)
@@ -236,7 +283,6 @@ def main(argv: Iterable[str] | None = None):
             print(f"  - {t.name}: duration={t.duration_seconds}s, deps=[{deps_str}]", flush=True)
         return 0
 
-    # Handle 'validate'
     if args.command == "validate":
         ts = load_tasks_from_text(args.task_file)
         errs = validate_tasks(ts)
@@ -257,8 +303,40 @@ def main(argv: Iterable[str] | None = None):
                       f"duration {ts.tasks[n].duration_seconds}s, deps={deps_str}", flush=True)
         return 0
 
-    return 0
+    if args.command == "run":
+        ts = load_tasks_from_text(args.task_file)
 
+        # Validate before running
+        errs = validate_tasks(ts)
+        if errs:
+            print("Validation errors found:", flush=True)
+            for e in errs:
+                print("  - " + e, flush=True)
+            return 2
+
+        # Expected runtime (critical path)
+        expected, _, _ = expected_total_runtime(ts)
+        print(f"Expected total runtime (critical path): {expected:.3f} seconds", flush=True)
+
+        # Concurrency selection
+        maxw = args.max_workers if args.max_workers > 0 else None
+        if maxw is None:
+            print("Running with unlimited parallelism...", flush=True)
+        else:
+            print(f"Running with up to {maxw} parallel worker(s)...", flush=True)
+
+        # Execute
+        actual = asyncio.run(run_tasks(ts, maxw, verbose=(not args.quiet)))
+
+        # Report
+        print("", flush=True)
+        print(f"Actual total wall-clock runtime: {actual:.3f} seconds", flush=True)
+        diff = actual - expected
+        sign = "+" if diff >= 0 else ""
+        print(f"Difference (actual - expected): {sign}{diff:.3f} seconds", flush=True)
+        return 0
+
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

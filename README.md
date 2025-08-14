@@ -16,7 +16,7 @@ Each task is represented by a name, a duration in seconds, and an optional list 
 ## How to run
 The sample test file is provided as test.txt. 
 
-The first command parses the task file and displays each task with its duration and dependencies. This explicitly runs parsed tasks from the file.
+The first command parses the task file and displays each task with its duration and dependencies. This explicitly runs parsed tasks from the file. I also added a quiet argument just in case you want to silence the debugging.
 
 ```bash
 python3 main.py print test.txt
