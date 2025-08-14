@@ -1,2 +1,11 @@
 # name, duration_seconds, dependencies
 build, 60, -
+test, 120, build
+lint, 90, build
+package, 180, test,lint
+deploy_staging, 150, package
+integration_tests, 240, deploy_staging
+deploy_production, 200, integration_tests
+cleanup, 60, deploy_production
+security_scan, 110, build
+notify_team, 30, deploy_production
